@@ -15,14 +15,21 @@
 package ddl
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"testing"
 	"time"
 
 	"github.com/pingcap/errors"
 	"github.com/pingcap/tidb/pkg/ddl/mock"
+	"github.com/pingcap/tidb/pkg/ddl/session"
+	"github.com/pingcap/tidb/pkg/meta/model"
 	"github.com/stretchr/testify/require"
+	"github.com/tikv/client-go/v2/oracle"
 	"go.uber.org/mock/gomock"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 )
 
 func reduceIntervals(t testing.TB) {
@@ -89,4 +96,75 @@ func TestUnSyncedJobTracker(t *testing.T) {
 	require.True(t, jt.isUnSynced(1))
 	jt.removeUnSynced(1)
 	require.False(t, jt.isUnSynced(1))
+}
+
+func TestDDLJobRuntimeLog(t *testing.T) {
+	now := time.Unix(2000, 0)
+	for _, tc := range []struct {
+		name    string
+		state   model.JobState
+		age     time.Duration
+		noStart bool
+		otherTp bool
+		wantLog bool
+	}{
+		{name: "running", state: model.JobStateRunning, age: 601 * time.Second, wantLog: true},
+		{name: "queueing", state: model.JobStateQueueing, age: 20 * time.Minute, wantLog: true},
+		{name: "threshold", state: model.JobStateRunning, age: 10 * time.Minute},
+		{name: "below threshold", state: model.JobStateQueueing, age: 599 * time.Second},
+		{name: "future start", state: model.JobStateRunning, age: -time.Minute},
+		{name: "missing start", state: model.JobStateRunning, age: 20 * time.Minute, noStart: true},
+		{name: "other type", state: model.JobStateRunning, age: 20 * time.Minute, otherTp: true},
+		{name: "paused", state: model.JobStatePaused, age: 20 * time.Minute},
+		{name: "pausing", state: model.JobStatePausing, age: 20 * time.Minute},
+		{name: "cancelling", state: model.JobStateCancelling, age: 20 * time.Minute},
+		{name: "rolling back", state: model.JobStateRollingback, age: 20 * time.Minute},
+		{name: "done", state: model.JobStateDone, age: 20 * time.Minute},
+		{name: "synced", state: model.JobStateSynced, age: 20 * time.Minute},
+		{name: "cancelled", state: model.JobStateCancelled, age: 20 * time.Minute},
+		{name: "rollback done", state: model.JobStateRollbackDone, age: 20 * time.Minute},
+		{name: "none", state: model.JobStateNone, age: 20 * time.Minute},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			job := &model.Job{ID: 123, Type: model.ActionAddIndex, State: tc.state,
+				StartTS: oracle.GoTimeToTS(now.Add(-tc.age)), RealStartTS: oracle.GoTimeToTS(now),
+				Query: "SQL containing sensitive data must not be logged"}
+			if tc.noStart {
+				job.StartTS = 0
+			}
+			if tc.otherTp {
+				job.Type = model.ActionCreateTable
+			}
+			var buf bytes.Buffer
+			logger := zap.New(zapcore.NewCore(zapcore.NewJSONEncoder(zap.NewProductionEncoderConfig()),
+				zapcore.AddSync(&buf), zap.InfoLevel))
+			logLongRunningAddIndexJob(logger, job, now)
+			if !tc.wantLog {
+				require.Empty(t, buf.String())
+				return
+			}
+			var entry map[string]any
+			require.NoError(t, json.Unmarshal(buf.Bytes(), &entry))
+			require.Equal(t, "info", entry["level"])
+			require.Equal(t, "DDL job runtime", entry["msg"])
+			require.Equal(t, "ddl_job_runtime", entry["event"])
+			require.Equal(t, float64(123), entry["job_id"])
+			require.Equal(t, "add index", entry["job_type"])
+			require.Equal(t, tc.state.String(), entry["job_state"])
+			require.Equal(t, tc.age.Seconds(), entry["duration_seconds"])
+			require.NotContains(t, buf.String(), job.Query)
+		})
+	}
+}
+
+func TestDDLJobRuntimeLogLoopCancelled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	// A retired Owner must not borrow a session or keep a timer loop alive.
+	(&jobScheduler{schCtx: ctx}).logDDLJobRuntimeLoop()
+}
+
+// NewDDLJobRuntimeLoggerForTest exposes the metadata scan to mock-storage tests.
+func NewDDLJobRuntimeLoggerForTest(pool *session.Pool) func(context.Context) error {
+	return (&jobScheduler{sessPool: pool}).logDDLJobRuntime
 }

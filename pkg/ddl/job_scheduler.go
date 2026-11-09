@@ -62,6 +62,11 @@ var (
 	schedulerLoopRetryInterval  = time.Second
 )
 
+const (
+	ddlJobRuntimeLogInterval  = 2 * time.Minute
+	ddlJobRuntimeLogThreshold = 10 * time.Minute
+)
+
 func init() {
 	// In test the wait duration can be reduced to make test case run faster
 	if intest.InTest {
@@ -191,6 +196,7 @@ func (s *jobScheduler) start() {
 		s.bgJobWorkerPool = newDDLWorkerPool(pools.NewResourcePool(workerFactory(backgroundWorker), 20, 20, 0), jobTypeReorg)
 	}
 	s.wg.RunWithLog(s.scheduleLoop)
+	s.wg.RunWithLog(s.logDDLJobRuntimeLoop)
 	s.wg.RunWithLog(func() {
 		s.schemaVerSyncer.SyncJobSchemaVerLoop(s.schCtx)
 	})
@@ -218,6 +224,67 @@ func (s *jobScheduler) close() {
 		s.bgJobWorkerPool.close()
 	}
 	failpoint.InjectCall("afterSchedulerClose")
+}
+
+// Monitor independently of scheduling, which skips running jobs and can stop
+// reading jobs when all worker slots are occupied.
+func (s *jobScheduler) logDDLJobRuntimeLoop() {
+	ticker := time.NewTicker(ddlJobRuntimeLogInterval)
+	defer ticker.Stop()
+	for {
+		if s.schCtx.Err() != nil {
+			return
+		}
+		ctx, cancel := context.WithTimeout(s.schCtx, 10*time.Second)
+		err := s.logDDLJobRuntime(ctx)
+		cancel()
+		if err != nil && s.schCtx.Err() == nil {
+			logutil.DDLLogger().Warn("scan DDL job runtime failed", zap.Error(err))
+		}
+		select {
+		case <-s.schCtx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+func (s *jobScheduler) logDDLJobRuntime(ctx context.Context) error {
+	sessCtx, err := s.sessPool.Get()
+	if err != nil {
+		return err
+	}
+	defer s.sessPool.Put(sessCtx)
+	jobs, err := getJobsBySQL(ctx, sess.NewSession(sessCtx), fmt.Sprintf("type = %d", model.ActionAddIndex))
+	if err != nil {
+		return err
+	}
+	if err = ctx.Err(); err != nil {
+		return err
+	}
+	now := time.Now()
+	logger := logutil.DDLLogger()
+	for _, job := range jobs {
+		logLongRunningAddIndexJob(logger, job, now)
+	}
+	return nil
+}
+
+func logLongRunningAddIndexJob(logger *zap.Logger, job *model.Job, now time.Time) {
+	if job.Type != model.ActionAddIndex || (!job.IsQueueing() && !job.IsRunning()) || job.StartTS == 0 {
+		return
+	}
+	// Submission age includes queueing and all paused intervals after a resume.
+	duration := now.Sub(model.TSConvert2Time(job.StartTS))
+	if duration <= ddlJobRuntimeLogThreshold {
+		return
+	}
+	logger.Info("DDL job runtime",
+		zap.String("event", "ddl_job_runtime"),
+		zap.Int64("job_id", job.ID),
+		zap.String("job_type", job.Type.String()),
+		zap.String("job_state", job.State.String()),
+		zap.Float64("duration_seconds", duration.Seconds()))
 }
 
 func (s *jobScheduler) processJobDuringUpgrade(sess *sess.Session, job *model.Job) (isRunnable bool, err error) {

@@ -23,14 +23,70 @@ import (
 	"time"
 
 	"github.com/pingcap/errors"
+	"github.com/pingcap/log"
 	"github.com/pingcap/tidb/pkg/ddl"
 	"github.com/pingcap/tidb/pkg/ddl/serverstate"
+	"github.com/pingcap/tidb/pkg/ddl/session"
 	"github.com/pingcap/tidb/pkg/meta/model"
 	"github.com/pingcap/tidb/pkg/testkit"
 	"github.com/pingcap/tidb/pkg/testkit/testfailpoint"
 	"github.com/pingcap/tidb/pkg/util"
 	"github.com/stretchr/testify/require"
+	"github.com/tikv/client-go/v2/oracle"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 )
+
+func TestDDLJobRuntimeLogScan(t *testing.T) {
+	store, dom := testkit.CreateMockStoreAndDomain(t)
+	dom.DDL().OwnerManager().CampaignCancel()
+	tk := testkit.NewTestKit(t, store)
+	ctx := context.Background()
+	now := time.Now()
+	oldStart := oracle.GoTimeToTS(now.Add(-20 * time.Minute))
+	for _, job := range []*model.Job{
+		{ID: 1, Type: model.ActionAddIndex, State: model.JobStateQueueing, StartTS: oldStart},
+		{ID: 2, Type: model.ActionAddIndex, State: model.JobStateRunning, StartTS: oldStart, RealStartTS: oracle.GoTimeToTS(now)},
+		{ID: 3, Type: model.ActionAddIndex, State: model.JobStatePaused, StartTS: oldStart},
+		{ID: 4, Type: model.ActionCreateTable, State: model.JobStateRunning, StartTS: oldStart},
+		{ID: 5, Type: model.ActionAddIndex, State: model.JobStateRunning, StartTS: oracle.GoTimeToTS(now)},
+	} {
+		encoded, err := job.Encode(false)
+		require.NoError(t, err)
+		tk.MustExec("insert into mysql.tidb_ddl_job(job_id, type, job_meta) values (?, ?, ?)", job.ID, int64(job.Type), encoded)
+	}
+	core, recorded := observer.New(zap.InfoLevel)
+	restore := log.ReplaceGlobals(zap.New(core), &log.ZapProperties{Level: zap.NewAtomicLevelAt(zap.InfoLevel)})
+	t.Cleanup(restore)
+	scan := ddl.NewDDLJobRuntimeLoggerForTest(session.NewSessionPool(dom.SysSessionPool()))
+	scanStart := time.Now()
+	require.NoError(t, scan(ctx))
+	scanEnd := time.Now()
+	entries := recorded.FilterMessage("DDL job runtime").All()
+	require.Len(t, entries, 2)
+	states := make(map[int64]string)
+	for _, entry := range entries {
+		fields := entry.ContextMap()
+		states[fields["job_id"].(int64)] = fields["job_state"].(string)
+		require.GreaterOrEqual(t, fields["duration_seconds"], scanStart.Sub(model.TSConvert2Time(oldStart)).Seconds())
+		require.LessOrEqual(t, fields["duration_seconds"], scanEnd.Sub(model.TSConvert2Time(oldStart)).Seconds())
+	}
+	require.Equal(t, map[int64]string{1: "queueing", 2: "running"}, states)
+	// Decode the complete result before logging so failed scans do not emit a
+	// misleading partial set of job records.
+	tk.MustExec(fmt.Sprintf("insert into mysql.tidb_ddl_job(job_id, type, job_meta) values (6, %d, 'invalid json')", model.ActionAddIndex))
+	recorded.TakeAll()
+	require.Error(t, scan(ctx))
+	require.Empty(t, recorded.FilterMessage("DDL job runtime").All())
+	deleteJobMetaByID(tk, 6)
+	deleteJobMetaByID(tk, 1)
+	deleteJobMetaByID(tk, 2)
+	require.NoError(t, scan(ctx))
+	require.Empty(t, recorded.FilterMessage("DDL job runtime").All())
+	cancelledCtx, cancel := context.WithCancel(ctx)
+	cancel()
+	require.Error(t, scan(cancelledCtx))
+}
 
 // TestDDLScheduling tests the DDL scheduling. See Concurrent DDL RFC for the rules of DDL scheduling.
 // This test checks the chosen job records to see if there are wrong scheduling, if job A and job B cannot run concurrently,
